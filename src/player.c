@@ -1,0 +1,391 @@
+#include "nn.h"
+/* Player data (ACNH 3.0.2). Layout found by memory analysis:
+     P-0xB8 : pocket 2, 20 slots (used when the bag is upgraded)
+     P      : pocket 1, 20 slots of { u16 id; u8 sys; u8 add; u32 param }  (empty id = 0xFFFE)
+     P+0xA0 : u32 pocket size (20 or 40), then 5 x 0xFFFFFFFF
+     P+0xB8 : wallet Bells as EncryptedInt32 { u32 enc; u16 adjust; u8 shift; u8 checksum }
+   The game keeps several copies (live + save buffers); we update all of them. */
+#define MAXCOPIES 6
+#define MAXSEEN 24
+static uptr s_copy[MAXCOPIES]; static int s_ncopies;
+volatile int g_player_state;   /* 0 idle, 1 searching, 2 ready, 3 not found */
+static OsThread s_th; static u8 s_stack[0x8000] __attribute__((aligned(0x1000)));
+void aden_item_bitmap(u8* bits);
+static u8 s_valid[0x10000/8];
+
+typedef struct { u32 enc; u16 adjust; u8 shift; u8 check; } EncInt;
+#define ENC_CONST 0x80E32B11u
+static u8 enc_ck(u32 e){ return (u8)((e&255)+((e>>8)&255)+((e>>16)&255)+(e>>24)-0x2D); }
+static int enc_valid(const EncInt* v){ return v->enc && v->shift<29 && enc_ck(v->enc)==v->check; }
+static u32 enc_get(const EncInt* v){ u32 s=(3+v->shift)&31; u32 r=s?((v->enc>>s)|(v->enc<<(32-s))):v->enc; return r+(ENC_CONST-v->adjust); }
+static void enc_set(EncInt* v,u32 val){ u32 s=(3+v->shift)&31; u32 x=val-(ENC_CONST-v->adjust); v->enc=s?((x<<s)|(x>>(32-s))):x; v->check=enc_ck(v->enc); }
+
+static int slot_ok(const u8* p){
+    u16 id=*(const u16*)p;
+    if(id==0xFFFE) return *(const u16*)(p+2)==0 && *(const u32*)(p+4)==0;
+    return id<0xFFFE;   /* newer ids may be missing from our name list */
+}
+static int sig_ok(uptr P){
+    if(*(u32*)(P-0x18)!=0) return 0;
+    for(int i=0;i<5;i++) if(*(u32*)(P-0x14+i*4)!=0xFFFFFFFF || *(u32*)(P+0xA4+i*4)!=0xFFFFFFFF) return 0;
+    u32 n=*(u32*)(P+0xA0); if(n!=20 && n!=40) return 0;
+    for(int i=0;i<20;i++) if(!slot_ok((u8*)(P+i*8))) return 0;
+    return enc_valid((EncInt*)(P+0xB8));
+}
+static void log_encs(uptr P, uptr lo, uptr hi){
+    uptr a=P>lo+0x100000?P-0x100000:lo, b=P+0x100000<hi-8?P+0x100000:hi-8; int n=0;
+    for(;a<b && n<60;a+=4){ EncInt* v=(EncInt*)a; if(!enc_valid(v)) continue; u32 x=enc_get(v); if(x>99999999u) continue;
+        n++; s64 d=(s64)(a-P); aden_log("  enc %s%lx = %u", d<0?"-":"+", d<0?-d:d, x); }
+}
+/* Build 15 wrongly wrote into unused player slots (empty pockets, 0 Bells). Undo that:
+   a slot whose 20 pocket entries are all 99k-Bell bags (08A4, param 0) is put back to empty / 0 Bells. */
+static void repair_unused(uptr P){
+    for(int i=0;i<20;i++){ uptr s=P+i*8; if(*(u16*)s!=0x08A4 || *(u16*)(s+2) || *(u32*)(s+4)) return; }
+    for(int i=0;i<20;i++){ uptr s=P+i*8; *(u32*)(s+4)=0; *(u16*)(s+2)=0; *(u16*)s=0xFFFE; }
+    enc_set((EncInt*)(P+0xB8),0);
+    aden_log("repaired unused player slot at %lx", P);
+}
+static int has_stuff(uptr P){
+    if(enc_get((EncInt*)(P+0xB8))) return 1;
+    for(int i=0;i<20;i++) if(*(u16*)(P+i*8)!=0xFFFE) return 1;
+    return 0;
+}
+/* ---- extra encrypted stats found relative to each player copy P ----
+   Each player record repeats 0x74A60 bytes later, so every offset is tried at P and P+0x74A60.
+   Nook Miles: P-0x25590 (49,430 in the test save).   Bank: P+0x2D5D4 (300,150).
+   Only candidates that are mapped RW, pass the checksum and agree on one value are kept. */
+#define STRIDE 0x74A60
+#define MAXF 8
+typedef struct { const char* name; s64 off; int n; uptr a[MAXF]; } Field;
+static Field s_fields[3]={ {"miles",-0x25590,0,{0}}, {"bank",0x2D5D4,0,{0}}, {"poki",0x3C608,0,{0}} };
+static int addr_rw(uptr a){
+    MemoryInfo mi; u32 pi;
+    if(svcQueryMemory(&mi,&pi,a)) return 0;
+    return (mi.perm&3)==3 && (mi.attr&1)==0 && mi.type!=0 && a+8<=mi.addr+mi.size;
+}
+static void find_fields(void){
+    for(int f=0;f<3;f++){
+        Field* F=&s_fields[f]; uptr cand[MAXF]; u32 val[MAXF]; int nc=0;
+        for(int i=0;i<s_ncopies;i++) for(int k=0;k<2;k++){
+            uptr a=s_copy[i]+F->off+(k?STRIDE:0);
+            if(nc>=MAXF || !addr_rw(a) || !enc_valid((EncInt*)a)) continue;
+            int dup=0; for(int j=0;j<nc;j++) if(cand[j]==a) dup=1; if(dup) continue;
+            cand[nc]=a; val[nc]=enc_get((EncInt*)a); nc++;
+        }
+        /* keep the value most candidates agree on */
+        int best=-1,bc=0;
+        for(int i=0;i<nc;i++){ int c=0; for(int j=0;j<nc;j++) if(val[j]==val[i]) c++; if(c>bc){bc=c;best=i;} }
+        F->n=0;
+        if(best>=0 && val[best]<=999999999u) for(int i=0;i<nc;i++) if(val[i]==val[best]) F->a[F->n++]=cand[i];
+        aden_log("%s: %d locations, value %u", F->name, F->n, F->n?val[best]:0);
+    }
+}
+static int field_live(int f){
+    Field* F=&s_fields[f]; int k=0;
+    for(int i=0;i<F->n;i++) if(addr_rw(F->a[i]) && enc_valid((EncInt*)F->a[i])) F->a[k++]=F->a[i];
+    F->n=k; return k;
+}
+int aden_stat_ok(int f){ return f>=0 && f<3 && s_fields[f].n>0; }
+u32 aden_stat_get(int f){ return aden_stat_ok(f) ? enc_get((EncInt*)s_fields[f].a[0]) : 0; }
+void aden_stat_set(int f,u32 v){
+    if(!aden_stat_ok(f) || !field_live(f)) return;
+    for(int i=0;i<s_fields[f].n;i++) enc_set((EncInt*)s_fields[f].a[i],v);
+    aden_log("%s set to %u in %d places", s_fields[f].name, v, s_fields[f].n);
+}
+static void find_personal_bases(void);
+static void find_thread(void* arg){
+    (void)arg;
+    uptr a=0; MemoryInfo mi; u32 pi; s_ncopies=0; int seen=0;
+    while(a<0x8000000000ul && s_ncopies<MAXCOPIES && seen<MAXSEEN){
+        if(svcQueryMemory(&mi,&pi,a)||mi.size==0) break;
+        uptr end=mi.addr+mi.size;
+        if((mi.perm&3)==3 && mi.type==5 && (mi.attr&1)==0 && mi.size>=0x1000){
+            for(uptr P=mi.addr+0x20; P+0xC0<end; P+=8){
+                if(*(u32*)(P-4)!=0xFFFFFFFF || *(u32*)(P-0x18)!=0) continue;
+                if(!sig_ok(P)) continue;
+                seen++;
+                repair_unused(P);
+                if(!has_stuff(P)){ aden_log("skip empty player slot at %lx", P); continue; }
+                s_copy[s_ncopies++]=P;
+                aden_log("player data copy %d at %lx (region %lx..%lx), wallet %u", s_ncopies, P, mi.addr, end, enc_get((EncInt*)(P+0xB8)));
+                if(s_ncopies>=MAXCOPIES || seen>=MAXSEEN) break;
+            }
+        }
+        a=end;
+    }
+    find_fields();
+    find_personal_bases();
+    g_player_state = s_ncopies ? 2 : 3;
+    aden_log("player search done: %d copies", s_ncopies);
+}
+void aden_player_find(void){
+    if(g_player_state==1||g_player_state==2) return;
+    aden_item_bitmap(s_valid);
+    g_player_state=1;
+    if(nn_os_CreateThread(&s_th,find_thread,0,s_stack,sizeof s_stack,20)){ g_player_state=0; return; }
+    nn_os_StartThread(&s_th);
+}
+/* re-check cached copies (memory can move after loading screens) */
+static int still_ok(void){
+    int k=0; for(int i=0;i<s_ncopies;i++) if(sig_ok(s_copy[i])) s_copy[k++]=s_copy[i];
+    s_ncopies=k; if(!k) g_player_state=0; return k;
+}
+int aden_player_ready(void){ return g_player_state==2 && still_ok(); }
+int aden_player_copies(void){ return s_ncopies; }
+u32 aden_wallet_get(void){ return s_ncopies? enc_get((EncInt*)(s_copy[0]+0xB8)) : 0; }
+void aden_wallet_set(u32 v){
+    if(v>99999) v=99999;
+    for(int i=0;i<s_ncopies;i++) enc_set((EncInt*)(s_copy[i]+0xB8),v);
+    aden_log("wallet set to %u in %d copies", v, s_ncopies);
+}
+/* returns number of items placed */
+int aden_pocket_add(u16 id, int qty, int stack){
+    if(!aden_player_ready()) return -1;
+    uptr P=s_copy[0]; u32 size=*(u32*)(P+0xA0);
+    int placed=0;
+    while(qty>0){
+        int slot=-1;
+        for(u32 i=0;i<size && i<40;i++){ uptr s= i<20 ? P+i*8 : P-0xB8+(i-20)*8; if(*(u16*)s==0xFFFE){ slot=i; break; } }
+        if(slot<0) break;
+        int n = stack>1 ? (qty>stack?stack:qty) : 1;
+        for(int c=0;c<s_ncopies;c++){
+            uptr Q=s_copy[c]; uptr s= slot<20 ? Q+slot*8 : Q-0xB8+(slot-20)*8;
+            *(u32*)(s+4) = stack>1 ? (u32)(n-1) : 0;
+            *(u16*)(s+2) = 0;
+            *(u16*)s = id;
+        }
+        qty-=n; placed+=n;
+    }
+    aden_log("pocket add %04X: placed %d", id, placed);
+    return placed;
+}
+
+/* =====================================================================
+   Whole-save features. The game keeps each save file in memory with the
+   same layout as the file on disk, so NHSE's 3.0 offsets apply directly.
+   P (our pocket anchor) sits at PERS_P inside the personal save.
+   ===================================================================== */
+#define PERS_P       0x37CA8
+#define PERS_SIZE    0x74A40
+#define PERS_ID      0xC248     /* TownId{u32,u16[10]} then PlayerId at +0x1C{u32,u16[10]} */
+#define PERS_MILES   0x12718
+#define PERS_RECIPES 0x6528C    /* 4 x 0x100-byte bit arrays: known, made, new, favourite */
+#define PERS_MANPU   0x4A85C    /* 256 reaction ids, then 8 wheel slots, then 256 new flags */
+#define PERS_CHEST   0x37D6C    /* home storage, 9000 items */
+#define CHEST_N      9000
+#define MAIN_SIZE    0x9B0E90
+#define MAIN_VILL    0x120
+#define VILL_SIZE    0x13230
+#define VILL_N       10
+#define MEM_SIZE     0x5F0
+#define MAIN_KABU    (0x110+0x48d920+0x2d40)
+extern const u8 g_recipe_valid[0x100]; extern const int g_nrecipes;
+extern const u8 g_reactions[]; extern const int g_nreactions;
+typedef struct{u8 sp,var;const char* name;} VName;
+extern const VName g_vnames[]; extern const int g_nvnames;
+
+static uptr s_pb[MAXF]; static int s_npb;          /* personal save bases */
+static uptr s_mb[4]; static int s_nmb;             /* island (main) save bases */
+volatile int g_island_state;                       /* 0 idle, 1 searching, 2 ready, 3 not found */
+
+static int range_chk(uptr a, uptr len, int heap_only){
+    /* every page in [a, a+len) must be mapped read/write (and be game heap if heap_only) */
+    uptr e=a+len;
+    while(a<e){ MemoryInfo mi; u32 pi; if(svcQueryMemory(&mi,&pi,a) || mi.size==0) return 0;
+        if((mi.perm&3)!=3 || mi.type==0 || (heap_only && mi.type!=5)) return 0; a=mi.addr+mi.size; }
+    return 1;
+}
+static int range_rw(uptr a, uptr len){ return range_chk(a,len,0); }
+static int heap_rw(uptr a, uptr len){ return range_chk(a,len,1); }
+static void find_personal_bases(void){
+    s_npb=0;
+    for(int i=0;i<s_fields[0].n && s_npb<MAXF;i++){
+        uptr b=s_fields[0].a[i]-PERS_MILES;
+        if(range_rw(b,PERS_SIZE)) s_pb[s_npb++]=b;
+    }
+    if(!s_npb) for(int i=0;i<s_ncopies;i++){ uptr b=s_copy[i]-PERS_P; if(range_rw(b,PERS_SIZE)) s_pb[s_npb++]=b; }
+    aden_log("personal saves: %d", s_npb);
+}
+static int kabu_ok(uptr k){
+    const u32* v=(const u32*)k; for(int i=0;i<15;i++) if(v[i]>1000) return 0;
+    return v[15]<4;
+}
+static void find_main(void){
+    s_nmb=0; if(!s_npb) { g_island_state=3; return; }
+    const u8* town=(const u8*)(s_pb[0]+PERS_ID); u32 tid=*(const u32*)town;
+    if(!tid){ aden_log("no town id"); g_island_state=3; return; }
+    /* if the personal save carries the 3.0 file header, the island save must too */
+    const u32* ph=(const u32*)s_pb[0];
+    int need_hdr = ph[0]==0xA0002 && ph[1]==0xA0028;
+    aden_log("personal header %x %x %x %x -> %s", ph[0],ph[1],ph[2],ph[3], need_hdr?"using header check":"no header, using layout check");
+    uptr a=0; MemoryInfo mi; u32 pi; int hits=0;
+    while(a<0x8000000000ul && s_nmb<4){
+        if(svcQueryMemory(&mi,&pi,a)||mi.size==0) break;
+        uptr end=mi.addr+mi.size;
+        /* only ordinary game heap (type 5), same as the player search; other memory
+           (graphics, shared, transfer buffers) can disappear under us */
+        if((mi.perm&3)==3 && mi.type==5 && (mi.attr&1)==0 && mi.size>=0x1000){
+            for(uptr x=mi.addr; x+24<=end; x+=4){
+                if(*(u32*)x!=tid || memcmp((void*)x,town,24)) continue;
+                hits++;
+                uptr M=x-(MAIN_VILL+4);
+                if(!heap_rw(M,MAIN_SIZE)) continue;
+                u8 sp=*(u8*)(M+MAIN_VILL);
+                if(sp>35 || !kabu_ok(M+MAIN_KABU)) continue;
+                if(need_hdr){ const u32* h=(const u32*)M; if(h[0]!=ph[0]||h[1]!=ph[1]||h[3]!=ph[3]) continue; }
+                else {
+                    /* no header: the slot before villager 0 must not look like a villager,
+                       and villager 0's own record must start with a valid species/variant */
+                    uptr prev=M+MAIN_VILL-VILL_SIZE+4;
+                    if(heap_rw(prev,24) && memcmp((void*)prev,town,24)==0) continue;
+                    if(*(u8*)(M+MAIN_VILL+1)>40) continue;
+                    if(*(u32*)(M+MAIN_KABU)==0 && *(u32*)(M+MAIN_KABU+4)==0) continue;
+                }
+                int dup=0; for(int j=0;j<s_nmb;j++) if(s_mb[j]==M) dup=1; if(dup) continue;
+                s_mb[s_nmb++]=M;
+                const u8* h=(const u8*)M;
+                aden_log("island save %d at %lx, header %02x%02x%02x%02x %02x%02x%02x%02x, turnips buy %u", s_nmb, M, h[0],h[1],h[2],h[3],h[4],h[5],h[6],h[7], *(u32*)(M+MAIN_KABU));
+                if(s_nmb>=4) break;
+            }
+        }
+        a=end;
+    }
+    aden_log("island search: %d town-id hits, %d saves", hits, s_nmb);
+    g_island_state = s_nmb ? 2 : 3;
+}
+static void island_thread(void* arg){ (void)arg; aden_log("island search started"); find_main(); }
+static OsThread s_th2; static u8 s_stack2[0x10000] __attribute__((aligned(0x1000)));
+void aden_island_find(void){
+    if(g_island_state==1||g_island_state==2) return;
+    if(g_player_state!=2) return;
+    g_island_state=1;
+    if(nn_os_CreateThread(&s_th2,island_thread,0,s_stack2,sizeof s_stack2,20)){ g_island_state=0; return; }
+    nn_os_StartThread(&s_th2);
+}
+int aden_island_ready(void){
+    if(g_island_state!=2) return 0;
+    int k=0; for(int i=0;i<s_nmb;i++) if(heap_rw(s_mb[i],0x1000) && kabu_ok(s_mb[i]+MAIN_KABU)) s_mb[k++]=s_mb[i];
+    s_nmb=k; if(!k) g_island_state=0; return k;
+}
+
+/* ---- names ---- */
+static void utf16_ascii(char* out,int cap,const u16* s,int n){
+    int k=0; for(int i=0;i<n && s[i] && k<cap-1;i++) out[k++]= s[i]<128 ? (char)s[i] : '?';
+    out[k]=0;
+}
+void aden_player_names(char* player,char* town,int cap){
+    player[0]=town[0]=0; if(!s_npb) return;
+    uptr id=s_pb[0]+PERS_ID;
+    utf16_ascii(town,cap,(const u16*)(id+4),10);
+    utf16_ascii(player,cap,(const u16*)(id+0x20),10);
+}
+
+/* ---- recipes ---- */
+int aden_recipes_learn_all(void){
+    if(!s_npb) return -1;
+    int learned=0;
+    for(int c=0;c<s_npb;c++){
+        u8* R=(u8*)(s_pb[c]+PERS_RECIPES);
+        int bad=0; for(int i=0;i<0x800;i++) if((R[i>>3]>>(i&7)&1) && !(g_recipe_valid[i>>3]>>(i&7)&1)) bad++;
+        if(bad>16){ aden_log("recipes: copy %d looks wrong (%d odd bits), skipped", c, bad); continue; }
+        int n=0;
+        for(int i=0;i<0x800;i++){
+            if(!(g_recipe_valid[i>>3]>>(i&7)&1) || (R[i>>3]>>(i&7)&1)) continue;
+            R[i>>3]|=1<<(i&7); R[0x200+(i>>3)]|=1<<(i&7); n++;
+        }
+        if(c==0) learned=n;
+    }
+    aden_log("recipes: learned %d new in %d copies", learned, s_npb);
+    return learned;
+}
+int aden_recipes_known(void){
+    if(!s_npb) return 0; const u8* R=(const u8*)(s_pb[0]+PERS_RECIPES); int n=0;
+    for(int i=0;i<0x800;i++) if((R[i>>3]>>(i&7)&1) && (g_recipe_valid[i>>3]>>(i&7)&1)) n++;
+    return n;
+}
+int aden_recipes_total(void){ return g_nrecipes; }
+
+/* ---- reactions ---- */
+int aden_reactions_learn_all(void){
+    if(!s_npb) return -1;
+    int added=0;
+    for(int c=0;c<s_npb;c++){
+        u8* M=(u8*)(s_pb[c]+PERS_MANPU);
+        int bad=0; for(int i=0;i<256;i++) if(M[i]>120) bad++;
+        if(bad){ aden_log("reactions: copy %d looks wrong, skipped", c); continue; }
+        int n=0;
+        for(int r=0;r<g_nreactions;r++){
+            u8 id=g_reactions[r]; int have=0, empty=-1;
+            for(int i=0;i<256;i++){ if(M[i]==id){have=1;break;} if(M[i]==0 && empty<0) empty=i; }
+            if(have||empty<0) continue;
+            M[empty]=id; M[256+8+empty]=1; n++;   /* mark as new so the game shows the badge */
+        }
+        if(c==0) added=n;
+    }
+    aden_log("reactions: added %d in %d copies", added, s_npb);
+    return added;
+}
+int aden_reactions_known(void){
+    if(!s_npb) return 0; const u8* M=(const u8*)(s_pb[0]+PERS_MANPU); int n=0;
+    for(int i=0;i<256;i++) if(M[i] && M[i]<=120) n++;
+    return n;
+}
+
+/* ---- home storage ---- */
+int aden_storage_add(u16 id,int qty,int stack){
+    if(!s_npb) return -1;
+    uptr S0=s_pb[0]+PERS_CHEST; int placed=0, slot=0;
+    for(int i=0;i<64;i++) if(!slot_ok((u8*)(S0+i*8))){ aden_log("storage looks wrong, not touching it"); return -1; }
+    while(qty>0){
+        while(slot<CHEST_N && *(u16*)(S0+slot*8)!=0xFFFE) slot++;
+        if(slot>=CHEST_N) break;
+        int n = stack>1 ? (qty>stack?stack:qty) : 1;
+        for(int c=0;c<s_npb;c++){
+            uptr s=s_pb[c]+PERS_CHEST+slot*8;
+            *(u32*)(s+4) = stack>1 ? (u32)(n-1) : 0; *(u16*)(s+2)=0; *(u16*)s=id;
+        }
+        qty-=n; placed+=n; slot++;
+    }
+    aden_log("storage add %04X: placed %d", id, placed);
+    return placed;
+}
+int aden_storage_free(void){
+    if(!s_npb) return 0; uptr S0=s_pb[0]+PERS_CHEST; int n=0;
+    for(int i=0;i<CHEST_N;i++) if(*(u16*)(S0+i*8)==0xFFFE) n++;
+    return n;
+}
+
+/* ---- turnips ---- */
+u32 aden_turnip_sell(void){ return s_nmb ? *(u32*)(s_mb[0]+MAIN_KABU+4) : 0; }
+u32 aden_turnip_buy(void){ return s_nmb ? *(u32*)(s_mb[0]+MAIN_KABU) : 0; }
+void aden_turnip_set(int sell,u32 v){
+    for(int c=0;c<s_nmb;c++){ u32* k=(u32*)(s_mb[c]+MAIN_KABU);
+        if(sell) for(int i=1;i<15;i++) k[i]=v; else k[0]=v; }
+    aden_log("turnip %s price set to %u", sell?"sell":"buy", v);
+}
+
+/* ---- villagers ---- */
+static uptr vill(int c,int k){ return s_mb[c]+MAIN_VILL+(uptr)k*VILL_SIZE; }
+static int my_mem(uptr V){
+    if(!s_npb) return -1; u32 me=*(u32*)(s_pb[0]+PERS_ID+0x1C);
+    for(int j=0;j<8;j++) if(*(u32*)(V+4+j*MEM_SIZE+0x1C)==me) return j;
+    return -1;
+}
+int aden_villager_info(int k,const char** name,int* friendship,int* moving){
+    if(!s_nmb || k<0 || k>=VILL_N) return 0;
+    uptr V=vill(0,k); u8 sp=*(u8*)V, var=*(u8*)(V+1);
+    if(sp>=35) return 0;
+    *name="(unknown)";
+    for(int i=0;i<g_nvnames;i++) if(g_vnames[i].sp==sp && g_vnames[i].var==var){ *name=g_vnames[i].name; break; }
+    int j=my_mem(V); *friendship = j<0 ? -1 : *(u8*)(V+4+j*MEM_SIZE+0x38+10);
+    *moving = (*(u8*)(V+0x1267a)&2)!=0;
+    return 1;
+}
+void aden_villager_friend(int k,u8 v){
+    for(int c=0;c<s_nmb;c++){ uptr V=vill(c,k); if(*(u8*)V>=35) continue; int j=my_mem(V); if(j>=0) *(u8*)(V+4+j*MEM_SIZE+0x38+10)=v; }
+    aden_log("villager %d friendship set to %u", k, v);
+}
+void aden_villager_moving(int k,int on){
+    for(int c=0;c<s_nmb;c++){ u8* m=(u8*)(vill(c,k)+0x1267a); *m=(u8)((*m&~2)|(on?2:0)); }
+    aden_log("villager %d moving out = %d", k, on);
+}
