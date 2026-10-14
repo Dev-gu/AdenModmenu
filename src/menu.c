@@ -9,6 +9,7 @@ u64  aden_input_take(void);
 int aden_player_ready(void); int aden_player_copies(void); void aden_player_find(void);
 int aden_stat_ok(int); u32 aden_stat_get(int); void aden_stat_set(int,u32);
 void aden_player_names(char*,char*,int);
+int aden_player_count(void); int aden_player_active(void); const char* aden_player_name(int); void aden_player_select(int);
 int aden_recipes_learn_all(void); int aden_recipes_known(void); int aden_recipes_total(void);
 int aden_reactions_learn_all(void); int aden_reactions_known(void);
 int aden_storage_add(u16,int,int); int aden_storage_free(void);
@@ -230,8 +231,23 @@ static void tab_player(void){
     char pn[24],tn[24]; aden_player_names(pn,tn,sizeof pn);
     if(pn[0]) put(ROW0,0,C_TEXT,"%s of %s",pn,tn); else text(ROW0,C_TEXT,"Character stats");
     enum { R_BELLS, R_MILES, R_BANK, R_POKI, R_RECIPES, R_REACT, R_BAGS, NROWS };
-    if(up()&&*cur>0)(*cur)--; if(down()&&*cur<NROWS-1)(*cur)++;
-    s_hl_row=ROW0+2+*cur;
+    /* islands with several residents: choose who to edit (row -1 = player picker) */
+    int np=aden_player_count(), minrow = np>1 ? -1 : 0;
+    if(*cur<minrow) *cur=minrow;
+    if(up()&&*cur>minrow)(*cur)--; if(down()&&*cur<NROWS-1)(*cur)++;
+    if(np>1){
+        int ap=aden_player_active();
+        put(ROW0+1,0,C_TEXT,"Editing: < %s >",aden_player_name(ap));
+        put(ROW0+1,1,C_DIM,"%d residents",np);
+        if(*cur==-1){
+            s_hl_row=ROW0+1;
+            if(left())  aden_player_select((ap+np-1)%np);
+            if(right()) aden_player_select((ap+1)%np);
+            text(ROW0+11,C_DIM,"Left/Right picks which resident to edit.");
+            text(ROW0+12,C_DIM,"Items you spawn go to this resident too.");
+        }
+    }
+    if(*cur>=0) s_hl_row=ROW0+2+*cur;
     static const char* LBL[4]={"Bells in wallet","Nook Miles","Bank savings","Poki"};
     for(int i=0;i<4;i++){
         put(ROW0+2+i,0,C_TEXT,"%s",LBL[i]);
@@ -243,7 +259,8 @@ static void tab_player(void){
     put(ROW0+2+R_REACT,0,C_TEXT,"Learn every reaction");    put(ROW0+2+R_REACT,1,C_TEXT,"%d known",aden_reactions_known());
     put(ROW0+2+R_BAGS,0,C_TEXT,"Fill pockets with 99,000 Bell bags");
     int H=ROW0+11;
-    if(*cur<=R_POKI){
+    if(*cur<0){ }
+    else if(*cur<=R_POKI){
         static const s32 STEP[4]={1000,1000,100000,100}, BIG[4]={10000,10000,1000000,1000};
         static const u32 CAP[4]={99999,999999,999999999,999999};
         int f=*cur-1;
@@ -344,7 +361,7 @@ static void tab_mods(void){
     if(s_modmsg[0]) text(ROW0+22,C_DIM,s_modmsg);
 }
 static void tab_about(void){
-    text(ROW0,C_TEXT,"Aden Modmenu v0.5 for ACNH 3.0.2");
+    text(ROW0,C_TEXT,"Aden Modmenu v0.5.2 for ACNH 3.0.2 / 3.0.3");
     text(ROW0+2,C_DIM,"Open from the Nook Phone. B closes.");
     text(ROW0+3,C_DIM,"Your character is paused while it is open.");
 }
