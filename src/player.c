@@ -8,6 +8,13 @@
 #define MAXCOPIES 6
 #define MAXSEEN 24
 static uptr s_copy[MAXCOPIES]; static int s_ncopies;
+#define PERS_P_     0x37CA8
+#define PERS_ID_PID (0xC248+0x1C)
+#define MAXCAND 48
+#define MAXPLAYERS 8
+typedef struct { u32 pid; int n; uptr P[MAXCOPIES]; char name[24]; } Player;
+static Player s_players[MAXPLAYERS]; static int s_nplayers, s_active;
+
 volatile int g_player_state;   /* 0 idle, 1 searching, 2 ready, 3 not found */
 static OsThread s_th; static u8 s_stack[0x8000] __attribute__((aligned(0x1000)));
 void aden_item_bitmap(u8* bits);
@@ -69,6 +76,8 @@ static void find_fields(void){
         for(int i=0;i<s_ncopies;i++) for(int k=0;k<2;k++){
             uptr a=s_copy[i]+F->off+(k?STRIDE:0);
             if(nc>=MAXF || !addr_rw(a) || !enc_valid((EncInt*)a)) continue;
+            if(s_nplayers){ uptr pidp=s_copy[i]+(k?STRIDE:0)-PERS_P_+PERS_ID_PID;
+                if(!addr_rw(pidp) || *(u32*)pidp!=s_players[s_active].pid) continue; }
             int dup=0; for(int j=0;j<nc;j++) if(cand[j]==a) dup=1; if(dup) continue;
             cand[nc]=a; val[nc]=enc_get((EncInt*)a); nc++;
         }
@@ -93,36 +102,84 @@ void aden_stat_set(int f,u32 v){
     aden_log("%s set to %u in %d places", s_fields[f].name, v, s_fields[f].n);
 }
 static void find_personal_bases(void);
+static void find_fields(void);
+/* Every player's save (up to 8 residents) can sit in memory, often more than once
+   (live data + save buffers). Copies are grouped by PlayerID; only the selected
+   player's copies are ever written. */
+static uptr s_cand[MAXCAND]; static int s_ncand;
+static int base_ok(uptr P){
+    /* the personal save around this pocket must be mapped and hold a valid Nook Miles value */
+    uptr base=P-PERS_P_; MemoryInfo mi; u32 pi;
+    if(base>P) return 0;
+    if(svcQueryMemory(&mi,&pi,base) || (mi.perm&3)!=3 || mi.type==0) return 0;
+    if(svcQueryMemory(&mi,&pi,base+0x74A40-8) || (mi.perm&3)!=3 || mi.type==0) return 0;
+    return enc_valid((EncInt*)(base+0x12718));
+}
+static void utf16_name(char* out,int cap,const u16* s){ int k=0; for(int i=0;i<10 && s[i] && k<cap-1;i++) out[k++]= s[i]<128?(char)s[i]:'?'; out[k]=0; }
+static void use_player(int i){
+    s_active=i; s_ncopies=0;
+    for(int k=0;k<s_players[i].n && k<MAXCOPIES;k++) s_copy[s_ncopies++]=s_players[i].P[k];
+    find_fields(); find_personal_bases();
+}
 static void find_thread(void* arg){
     (void)arg;
-    uptr a=0; MemoryInfo mi; u32 pi; s_ncopies=0; int seen=0;
-    while(a<0x8000000000ul && s_ncopies<MAXCOPIES && seen<MAXSEEN){
+    uptr a=0; MemoryInfo mi; u32 pi; s_ncopies=0; s_ncand=0; s_nplayers=0; s_active=0;
+    int empty=0;
+    while(a<0x8000000000ul){
         if(svcQueryMemory(&mi,&pi,a)||mi.size==0) break;
         uptr end=mi.addr+mi.size;
         if((mi.perm&3)==3 && mi.type==5 && (mi.attr&1)==0 && mi.size>=0x1000){
             for(uptr P=mi.addr+0x20; P+0xC0<end; P+=8){
                 if(*(u32*)(P-4)!=0xFFFFFFFF || *(u32*)(P-0x18)!=0) continue;
                 if(!sig_ok(P)) continue;
-                seen++;
                 repair_unused(P);
-                if(!has_stuff(P)){ aden_log("skip empty player slot at %lx", P); continue; }
-                s_copy[s_ncopies++]=P;
-                aden_log("player data copy %d at %lx (region %lx..%lx), wallet %u", s_ncopies, P, mi.addr, end, enc_get((EncInt*)(P+0xB8)));
-                if(s_ncopies>=MAXCOPIES || seen>=MAXSEEN) break;
+                if(base_ok(P)){
+                    u32 pid=*(u32*)(P-PERS_P_+PERS_ID_PID);
+                    u16 c0=*(u16*)(P-PERS_P_+PERS_ID_PID+4);
+                    if(!pid || !c0){ empty++; continue; }     /* unused resident slot (no id / no name) */
+                    int g=-1; for(int j=0;j<s_nplayers;j++) if(s_players[j].pid==pid) g=j;
+                    if(g<0 && s_nplayers<MAXPLAYERS){ g=s_nplayers++; s_players[g].pid=pid; s_players[g].n=0;
+                        utf16_name(s_players[g].name,sizeof s_players[g].name,(const u16*)(P-PERS_P_+PERS_ID_PID+4)); }
+                    if(g>=0 && s_players[g].n<MAXCOPIES){ s_players[g].P[s_players[g].n++]=P;
+                        aden_log("player %s (id %x) copy at %lx, wallet %u", s_players[g].name, pid, P, enc_get((EncInt*)(P+0xB8))); }
+                } else if(s_ncand<MAXCAND) s_cand[s_ncand++]=P;   /* pocket found but layout unknown (kept for fallback only) */
             }
         }
         a=end;
     }
-    find_fields();
-    find_personal_bases();
+    aden_log("search: %d players, %d empty slots, %d other pocket matches", s_nplayers, empty, s_ncand);
+    if(s_nplayers){
+        /* default to the player with the most copies in memory: that is the one being played */
+        int best=0; for(int j=1;j<s_nplayers;j++) if(s_players[j].n>s_players[best].n) best=j;
+        use_player(best);
+        aden_log("editing player %s (%d copies)", s_players[best].name, s_ncopies);
+    } else {
+        /* fallback: old behaviour, any pocket that has something in it */
+        for(int i=0;i<s_ncand && s_ncopies<MAXCOPIES;i++) if(has_stuff(s_cand[i])) s_copy[s_ncopies++]=s_cand[i];
+        aden_log("fallback: %d pocket copies", s_ncopies);
+        find_fields(); find_personal_bases();
+    }
     g_player_state = s_ncopies ? 2 : 3;
     aden_log("player search done: %d copies", s_ncopies);
 }
+int aden_player_count(void){ return s_nplayers; }
+int aden_player_active(void){ return s_active; }
+const char* aden_player_name(int i){ return (i>=0 && i<s_nplayers) ? s_players[i].name : ""; }
+void aden_player_select(int i){
+    if(g_player_state!=2 || i<0 || i>=s_nplayers || i==s_active) return;
+    use_player(i);
+    extern volatile int g_island_state; g_island_state=0;   /* friendship is per player */
+    aden_log("switched to player %s (%d copies)", s_players[i].name, s_ncopies);
+}
+static int s_th_used, s_th2_used;
 void aden_player_find(void){
     if(g_player_state==1||g_player_state==2) return;
     aden_item_bitmap(s_valid);
     g_player_state=1;
-    if(nn_os_CreateThread(&s_th,find_thread,0,s_stack,sizeof s_stack,20)){ g_player_state=0; return; }
+    /* a previous search thread must be cleaned up before its slot is reused */
+    if(s_th_used){ nn_os_WaitThread(&s_th); nn_os_DestroyThread(&s_th); s_th_used=0; }
+    if(nn_os_CreateThread(&s_th,find_thread,0,s_stack,sizeof s_stack,20)){ g_player_state=3; aden_log("could not start search thread"); return; }
+    s_th_used=1;
     nn_os_StartThread(&s_th);
 }
 /* re-check cached copies (memory can move after loading screens) */
@@ -259,7 +316,9 @@ void aden_island_find(void){
     if(g_island_state==1||g_island_state==2) return;
     if(g_player_state!=2) return;
     g_island_state=1;
-    if(nn_os_CreateThread(&s_th2,island_thread,0,s_stack2,sizeof s_stack2,20)){ g_island_state=0; return; }
+    if(s_th2_used){ nn_os_WaitThread(&s_th2); nn_os_DestroyThread(&s_th2); s_th2_used=0; }
+    if(nn_os_CreateThread(&s_th2,island_thread,0,s_stack2,sizeof s_stack2,20)){ g_island_state=3; aden_log("could not start island thread"); return; }
+    s_th2_used=1;
     nn_os_StartThread(&s_th2);
 }
 int aden_island_ready(void){

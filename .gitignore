@@ -1,0 +1,14 @@
+build/
+out/
+_icon_tmp/
+__pycache__/
+# game files - never commit these, they belong to Nintendo
+*.nso
+*.npdm
+*.zs
+*.sarc
+*.bntx
+*.bin
+romfs/
+exefs/
+items.txt

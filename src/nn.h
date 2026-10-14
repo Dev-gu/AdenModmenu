@@ -29,6 +29,8 @@ typedef struct { u8 data[0x1C0]; } __attribute__((aligned(16))) OsThread;
 Result nn_os_CreateThread(OsThread*, void(*)(void*), void*, void*, u64, int) __asm__("_ZN2nn2os12CreateThreadEPNS0_10ThreadTypeEPFvPvES3_S3_mi");
 void   nn_os_StartThread(OsThread*) __asm__("_ZN2nn2os11StartThreadEPNS0_10ThreadTypeE");
 void   nn_os_SleepThread(s64 ns)    __asm__("_ZN2nn2os11SleepThreadENS_8TimeSpanE");
+void   nn_os_WaitThread(OsThread*)  __asm__("_ZN2nn2os10WaitThreadEPNS0_10ThreadTypeE");
+void   nn_os_DestroyThread(OsThread*) __asm__("_ZN2nn2os13DestroyThreadEPNS0_10ThreadTypeE");
 /* hid */
 typedef struct { s64 sampling; u64 buttons; s32 lx, ly, rx, ry; u32 attr; u32 _pad; } NpadState;
 int nn_hid_GetNpadStates_FullKey (NpadState*, int, const u32*) __asm__("_ZN2nn3hid13GetNpadStatesEPNS0_16NpadFullKeyStateEiRKj");

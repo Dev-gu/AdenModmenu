@@ -111,6 +111,7 @@ static void build(void){
         aden_log("mod %s: %d files", s_on[i], got);
     }
     int own=walk(OWN_ROOT,"",0);
+    if(!own) aden_log("WARNING: no files in sd:/aden/romfs - the app will show as 'Room Sketch'. Copy the aden folder to the SD card.");
     aden_log("romfs overrides: %d files total (%d from Aden Modmenu)", s_nfiles, own);
 }
 
