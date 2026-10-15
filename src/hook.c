@@ -18,9 +18,16 @@ static void recv_thread(void* arg){
     svcExitThread();
     for(;;);
 }
-static int get_proc_handle(void){
-    u64 h=0;
-    if(svcGetInfo(&h,65000,0,0)==0 && h){ s_proc=(Handle)h; aden_log("proc handle via mesosphere info: %x",s_proc); return 0; }
+/* InfoType 65001 = MesosphereCurrentProcess (Atmosphere, Eden, yuzu forks).
+   NOTE: 65000 is MesosphereMeta (kernel version) - never use it for a handle. */
+#define INFO_MESOSPHERE_CURRENT_PROCESS 65001
+static int get_proc_handle_info(void){
+    u64 h=0; Result r=svcGetInfo(&h,INFO_MESOSPHERE_CURRENT_PROCESS,0,0);
+    if(r || !h || (h>>32)){ aden_log("current-process info not available (%x)",r); return -1; }
+    s_proc=(Handle)h; aden_log("proc handle via current-process info: %x",s_proc);
+    return 0;
+}
+static int get_proc_handle_ipc(void){
     Handle srv,cli,th; Result r;
     if((r=svcCreateSession(&srv,&cli,0,0))){ aden_log("CreateSession failed %x",r); return -1; }
     if((r=svcCreateThread(&th,(void*)recv_thread,(void*)(uptr)srv,s_thread_stack+sizeof s_thread_stack,0x20,-2))){ aden_log("CreateThread failed %x",r); return -1; }
@@ -72,9 +79,15 @@ static u32* rw_of(uptr rx){
 }
 
 HIDDEN int aden_hook_init(void){
-    if(get_proc_handle()) return -1;
-    /* main's .text */
-    if(map_alias(g_main_base, g_main_text_size)) return -1;
+    /* try the official query first; if its handle can't map the game's code, fall back to the IPC trick */
+    int via_info = get_proc_handle_info()==0;
+    if(!via_info && get_proc_handle_ipc()) return -1;
+    if(map_alias(g_main_base, g_main_text_size)){
+        if(!via_info) return -1;
+        aden_log("mapping with that handle failed - retrying with the IPC trick");
+        svcCloseHandle(s_proc); s_proc=0;
+        if(get_proc_handle_ipc() || map_alias(g_main_base, g_main_text_size)) return -1;
+    }
     if(map_alias((uptr)aden_tramp_area, aden_tramp_area_end-aden_tramp_area)) return -1;
     s_tramp_rx=(u32*)aden_tramp_area; s_tramp_rw=rw_of((uptr)aden_tramp_area);
     extern void nnMain(void); uptr nm=(uptr)&nnMain;
